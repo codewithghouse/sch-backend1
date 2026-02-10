@@ -1,13 +1,13 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import admin from 'firebase-admin';
-import { Resend } from 'resend';
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import admin from "firebase-admin";
+import { Resend } from "resend";
 
 dotenv.config();
 
-// --- 5️⃣ FIREBASE ADMIN INIT ---
-// Ensure FIREBASE_SERVICE_ACCOUNT is set in your Render environment as a full JSON string
+// --- 4️⃣ FIREBASE ADMIN (VERIFY) ---
+// Ensure Firebase Admin is initialized exactly once
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
@@ -17,108 +17,76 @@ admin.initializeApp({
 const db = admin.firestore();
 
 const app = express();
-const resend = new Resend(process.env.RESEND_API_KEY);
 const PORT = process.env.PORT || 3001;
 
-// --- 7️⃣ CORS CONFIG ---
+// --- 3️⃣ CORS (VERIFY & KEEP) ---
+// CORS must strictly allow only the frontend
 app.use(
     cors({
-        origin: process.env.APP_BASE_URL || 'http://localhost:5173',
+        origin: process.env.APP_BASE_URL,
         methods: ["GET", "POST", "DELETE"],
     })
 );
 
 app.use(express.json());
 
-// --- 6️⃣ BACKEND API CONTRACTS ---
-
-// Health Check
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: "ok" });
+// --- 7️⃣ HEALTH CHECK (MANDATORY) ---
+app.get("/health", (req, res) => {
+    res.json({ status: "ok" });
 });
 
-// Invite Teacher
-app.post('/invite-teacher', async (req, res) => {
-    console.log('🔥 BACKEND INVITE ROUTE HIT');
-    const { email, schoolId, classIds, subjects, schoolName } = req.body;
-
-    if (!email || !schoolId) {
-        return res.status(400).json({ error: 'Missing required fields: email and schoolId' });
-    }
+// --- 5️⃣ INVITE ROUTE ---
+app.post("/invite-teacher", async (req, res) => {
+    console.log("🔥 BACKEND INVITE ROUTE HIT");
 
     try {
-        const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
-        const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:5173';
+        const { email, schoolId, classIds } = req.body;
 
-        // 1. Create invites document in Firestore
-        const inviteRef = await db.collection('invites').add({
-            email: email.toLowerCase().trim(),
-            role: 'teacher',
-            schoolId,
-            classIds: classIds || [],
-            subjects: subjects || [],
-            status: 'pending',
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        console.log(`✅ Invite Document Created: ${inviteRef.id}`);
-
-        // 2. Send email via Resend
-        const { data, error } = await resend.emails.send({
-            from: fromEmail,
-            to: [email],
-            subject: `Invitation to join ${schoolName || 'AcademiVis'}`,
-            html: `
-                <div style="font-family: sans-serif; max-width: 600px; margin: auto; padding: 20px;">
-                    <h2 style="color: #4F46E5;">You've Been Invited!</h2>
-                    <p>Hello,</p>
-                    <p>You have been invited as a Teacher to join <strong>${schoolName || 'the school dashboard'}</strong>.</p>
-                    <p>To activate your account, please login using the link below:</p>
-                    <div style="margin: 30px 0; text-align: center;">
-                        <a href="${appBaseUrl}/login?invite=${inviteRef.id}" style="background-color: #4F46E5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold;">
-                            Accept Invitation
-                        </a>
-                    </div>
-                </div>
-            `
-        });
-
-        if (error) {
-            console.error('❌ Resend Error:', error);
-            return res.status(500).json({ error: 'Failed to send email' });
+        if (!email || !schoolId) {
+            return res.status(400).json({ error: "Missing required fields" });
         }
 
-        // Return proper JSON response
-        res.status(200).json({ success: true });
-
-    } catch (error) {
-        console.error('❌ Server Error:', error.message);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// Generic Invite (Parents/Other)
-app.post('/send-invite', async (req, res) => {
-    const { email, type, schoolName, studentName } = req.body;
-
-    try {
-        const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
-        const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:5173';
-
-        const { data, error } = await resend.emails.send({
-            from: fromEmail,
-            to: [email],
-            subject: type === 'parent' ? `Child added to ${schoolName}` : `Invitation from ${schoolName}`,
-            text: `Hello, your child ${studentName || ''} has been added. Login at: ${appBaseUrl}/login`
+        const inviteRef = await db.collection("invites").add({
+            email,
+            schoolId,
+            classIds: classIds || [],
+            status: "pending",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        if (error) throw error;
-        res.status(200).json({ success: true });
+        const inviteLink = `${process.env.APP_BASE_URL}/login?invite=${inviteRef.id}`;
+
+        const resend = new Resend(process.env.RESEND_API_KEY);
+
+        const result = await resend.emails.send({
+            from: process.env.RESEND_FROM_EMAIL,
+            to: email,
+            subject: "You're invited to join the school dashboard",
+            html: `
+        <p>You have been invited.</p>
+        <p><a href="${inviteLink}">Accept Invite</a></p>
+      `,
+        });
+
+        // Log real Resend errors in logs if any
+        if (result.error) {
+            console.error("❌ Resend error detail:", result.error);
+            throw new Error(result.error.message || "Resend failed to send email");
+        }
+
+        console.log("✅ Resend success:", result);
+
+        return res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("❌ INVITE FAILED:", err);
+
+        return res.status(500).json({
+            error: "Invite failed",
+            message: err.message,
+        });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Production Backend listening on port ${PORT}`);
+    console.log(`🚀 Backend listening on port ${PORT}`);
 });
