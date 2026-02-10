@@ -2,91 +2,93 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
-import { Resend } from "resend";
+import { verifySmtp, sendInviteEmail } from "./email.js";
 
 dotenv.config();
 
-// --- 4️⃣ FIREBASE ADMIN (VERIFY) ---
-// Ensure Firebase Admin is initialized exactly once
+// --- 7️⃣ FIREBASE ADMIN INIT ---
+// Ensure FIREBASE_SERVICE_ACCOUNT is set in your Render environment as a full JSON string
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+// Fix potential newline issues in private key from ENV
+if (serviceAccount.private_key) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+}
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
 });
 
-const db = admin.firestore();
+export const db = admin.firestore();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// --- 3️⃣ CORS (VERIFY & KEEP) ---
+// --- 6️⃣ CORS SETUP ---
 // CORS must strictly allow only the frontend
 app.use(
     cors({
-        origin: process.env.APP_BASE_URL,
-        methods: ["GET", "POST", "DELETE"],
+        origin: "https://schooldashboard-ten.vercel.app",
+        methods: ["GET", "POST"],
     })
 );
 
 app.use(express.json());
 
-// --- 7️⃣ HEALTH CHECK (MANDATORY) ---
+// --- HEALTH CHECK ---
 app.get("/health", (req, res) => {
     res.json({ status: "ok" });
 });
 
-// --- 5️⃣ INVITE ROUTE ---
-app.post("/invite-teacher", async (req, res) => {
+// --- 5️⃣ INVITE API (ONE ROUTE FOR ALL) ---
+app.post("/invite-user", async (req, res) => {
     console.log("🔥 BACKEND INVITE ROUTE HIT");
 
     try {
-        const { email, schoolId, classIds } = req.body;
+        const { email, role, schoolId, studentId, name, subjects, classIds } = req.body;
 
-        if (!email || !schoolId) {
-            return res.status(400).json({ error: "Missing required fields" });
+        if (!email || !role || !schoolId) {
+            return res.status(400).json({ error: "Missing fields" });
         }
 
-        const inviteRef = await db.collection("invites").add({
-            email,
+        if (role === "parent" && !studentId) {
+            return res.status(400).json({ error: "studentId required for parent" });
+        }
+
+        // Prepare invite document with all necessary metadata for onboarding
+        const inviteData = {
+            email: email.toLowerCase().trim(),
+            role,
             schoolId,
-            classIds: classIds || [],
             status: "pending",
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        };
 
-        const inviteLink = `${process.env.APP_BASE_URL}/login?invite=${inviteRef.id}`;
-
-        const resend = new Resend(process.env.RESEND_API_KEY);
-
-        const result = await resend.emails.send({
-            from: process.env.RESEND_FROM_EMAIL,
-            to: email,
-            subject: "You're invited to join the school dashboard",
-            html: `
-        <p>You have been invited.</p>
-        <p><a href="${inviteLink}">Accept Invite</a></p>
-      `,
-        });
-
-        // Log real Resend errors in logs if any
-        if (result.error) {
-            console.error("❌ Resend error detail:", result.error);
-            throw new Error(result.error.message || "Resend failed to send email");
+        // Add role-specific metadata
+        if (role === "teacher") {
+            inviteData.name = name || "";
+            inviteData.subjects = subjects || [];
+            inviteData.classIds = classIds || [];
+        } else if (role === "parent") {
+            inviteData.studentId = studentId;
         }
 
-        console.log("✅ Resend success:", result);
+        const inviteRef = await db.collection("invites").add(inviteData);
 
-        return res.json({ success: true });
+        const inviteLink = `${process.env.APP_BASE_URL}/accept-invite?id=${inviteRef.id}`;
+
+        await sendInviteEmail({ to: email, role, inviteLink });
+
+        console.log(`✅ Invite sent to ${email} as ${role} (ID: ${inviteRef.id})`);
+        res.json({ success: true, inviteId: inviteRef.id });
     } catch (err) {
-        console.error("❌ INVITE FAILED:", err);
-
-        return res.status(500).json({
-            error: "Invite failed",
-            message: err.message,
-        });
+        console.error("❌ INVITE FAILED", err);
+        res.status(500).json({ error: "Invite failed", message: err.message });
     }
 });
 
-app.listen(PORT, () => {
+// Start server and check SMTP
+app.listen(PORT, async () => {
     console.log(`🚀 Backend listening on port ${PORT}`);
+    await verifySmtp();
 });
